@@ -1,3 +1,4 @@
+import time
 import requests
 import sqlalchemy
 import pandas as pd
@@ -16,6 +17,7 @@ class data_pipeline():
         self.host=constants.get("CONSTANTS","host")
         self.port=constants.get("CONSTANTS","port")
         self.db_name=constants.get("CONSTANTS","db_name")
+        self.db_type=constants.get("CONSTANTS","rdbms_type")
 
         self.filename=constants.get("CONSTANTS","csv_file_name")
         self.openweather=constants.get("CONSTANTS","openweathermap_api")
@@ -27,29 +29,50 @@ class data_pipeline():
         self.start_pipeline()
 
     def connect_db(self,con_type) -> object:
-        if con_type == 'mysql':
-            return mysql.connector.connect(user=self.user, password=self.pwd, host=self.host)
+        if con_type == self.db_type:
+            try:
+                return mysql.connector.connect(user=self.user, password=self.pwd, host=self.host)
+            except:
+                print("connection failed")
         else:
-            return sqlalchemy.create_engine("""mysql+mysqlconnector://{}:{}@{}:{}/{}""".format(self.user,self.pwd,self.host,self.port,self.db_name), echo=False)
+            try:
+                return sqlalchemy.create_engine("""mysql+mysqlconnector://{}:{}@{}:{}/{}""".format(self.user,self.pwd,self.host,self.port,self.db_name), echo=False)
+            except:
+                print("connection failed")
         
     def execute_cursor(self,cnx,sql) -> None:
         cursor = cnx.cursor()
-        cursor.execute(sql)
+        try:
+            cursor.execute(sql)
+        except:
+            print("mysql cursor execute error")
 
     def load_df_to_db(self,df,cnx,table_name) -> None:
-        df.to_sql(con=cnx, name=table_name, if_exists='append', method='multi', index=False)
+        try:
+            df.to_sql(con=cnx, name=table_name, if_exists='append', method='multi', index=False)
+        except:
+            print('Load for {} dataframe into {} table failed'.format(df,table_name))
 
     def close_connect(self,cnx,con_type):
-        if con_type == 'mysql':
-            cnx.close()
+        if con_type == self.db_type:
+            try:
+                cnx.close()
+            except:
+                print('connection close exception')
         else:
-            cnx.dispose()
+            try:
+                cnx.dispose()
+            except:
+                print('connection close exception')
 
     def get_request(self,url) -> object:
         return requests.get(url)
     
     def read_csv_file(self,file_path) -> object:
-        return pd.read_csv(file_path)
+        try:
+            return pd.read_csv(file_path, header='infer', skiprows=0, skip_blank_lines=True, on_bad_lines='warn')
+        except:
+            print('error reading input file {}'.format(file_path))
     
     def drop_columns(self,df,drop_list) -> None:
         df.drop(columns=drop_list, inplace=True)
@@ -97,6 +120,12 @@ class data_pipeline():
 
         self.drop_columns(df_weather,['sys.type','sys.id','sys.sunrise','sys.sunset'])
 
+        if 'rain.1h' in df_weather.columns:
+            self.drop_columns(df_weather,['rain.1h'])
+
+        if 'wind.gust' in df_weather.columns:
+            self.drop_columns(df_weather,['wind.gust'])
+
         df_weather = self.df_column_rename(df_weather,{'name':'address.city','id':'city_id'})
 
         df_merged = df_users.merge(df_weather, on= 'address.city', how = 'left')
@@ -106,16 +135,21 @@ class data_pipeline():
         # df_merged.select_dtypes('object').fillna("NotAvailable", inplace=True)
 
         for i in df_merged.select_dtypes('object').columns:
-            self.fillna_string(df_merged, i)
+            if i == 'weather':
+                pass
+            else:
+                self.fillna_string(df_merged, i)
 
         for i in df_merged.select_dtypes('float64').columns:
             self.fillna_numeric(df_merged, i)
+
         # Filling NULL for weather column
-
         for i in range(0,len(df_merged['weather'])):
-            if pd.isnull(df_merged['weather'][i]) or df_merged['weather'][i] == "NotAvailable":
+            if type(df_merged['weather'][i]) is list:
+                if pd.isnull(df_merged['weather'][i][0]):
+                    df_merged['weather'][i]=[{'id':-999.0,'main':"NotAvailable",'description':"NotAvailable",'icon':"NotAvailable"}]
+            elif pd.isnull(df_merged['weather'][i]):
                 df_merged['weather'][i]=[{'id':-999.0,'main':"NotAvailable",'description':"NotAvailable",'icon':"NotAvailable"}]
-
 
         explode = df_merged['weather'].explode()
 
@@ -187,6 +221,7 @@ class data_pipeline():
         df_temp = self.df_column_rename(df_temp, {'price':'total_price_per_cntry'})
         df_final_ds = df_final_ds.join(df_temp, on='sys.country', how='left')
 
+        print("Final Dataset Ready for validation. Moving to Load Data")
         self.end_pipeline(df_final_ds)
 
     def end_pipeline(self,df) -> None:
@@ -207,24 +242,38 @@ class data_pipeline():
         df_orders = self.df_column_rename(df_orders, ['id','order_id','product_id','quantity','price','order_date','order_date_day','order_date_mnth','order_date_week','order_date_year','order_date_yr_mnth'])
         self.drop_dup(df_orders)
 
-        cnx = self.connect_db("mysql")
+        cnx = self.connect_db(self.db_type)
 
-        self.execute_cursor(cnx,"""create database if not exists aiq;""")
-        self.execute_cursor(cnx,"""use aiq;""")
+        self.execute_cursor(cnx,"""create database if not exists {};""".format(self.db_name))
+        self.execute_cursor(cnx,"""use {};""".format(self.db_name))
 
         conn = self.connect_db("sqlalchemy")
         
-        for i in self.pkl_map['root']:
-            self.execute_cursor(cnx,"""DROP TABLE IF EXISTS {};""".format(i['table_name']))
-            self.execute_cursor(cnx,i['create_statement'])
-            
-        self.load_df_to_db(df_customer,conn,'customer')
-        self.load_df_to_db(df_company,conn,'company')
-        self.load_df_to_db(df_weather,conn,'weather')
-        self.load_df_to_db(df_orders,conn,'orders')
+        # for i in self.pkl_map['root']:
+        #     self.execute_cursor(cnx,"""DROP TABLE IF EXISTS {};""".format(i['tablename']))
 
-        self.close_connect(cnx,"msql")
+        for i in self.pkl_map['root']:
+            self.execute_cursor(cnx,i['create_statement'])
+            time.sleep(2)
+            
+        for i in self.pkl_map['root']:
+            time.sleep(2)
+            if i['tablename'] == 'customer':
+                self.load_df_to_db(df_customer,conn,i['tablename'])
+            elif i['tablename'] == 'company':
+                self.load_df_to_db(df_company,conn,i['tablename'])
+            elif i['tablename'] == 'weather':
+                self.load_df_to_db(df_weather,conn,i['tablename'])
+            elif i['tablename'] == 'orders':
+                self.load_df_to_db(df_orders,conn,i['tablename'])
+            else:
+                print('table mismatch')
+        
+        print("Data Load Completed in {} RDBMS under {} database".format(self.db_type,self.db_name))
+        self.close_connect(cnx,self.db_type)
         self.close_connect(conn,"sqlalchemy")
+        print("Connection closed")
 
 if __name__ == "__main__":
     data_pipeline()
+    print("Run Pipeline Completed")
