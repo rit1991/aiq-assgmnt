@@ -23,7 +23,8 @@ pkl_map=dict({
             total_orders_per_customer FLOAT,
             times_orders_per_customer INT,
             total_price_per_cntry FLOAT
-            )"""
+            )
+            """
         },
         {
             'tablename':'company',
